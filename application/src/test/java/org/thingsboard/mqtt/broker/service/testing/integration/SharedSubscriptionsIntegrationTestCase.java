@@ -44,6 +44,8 @@ import org.thingsboard.mqtt.broker.service.mqtt.client.session.ClientSessionCtxS
 import org.thingsboard.mqtt.broker.session.ClientSessionCtx;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -67,28 +69,43 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
     @Autowired
     private ClientSessionCtxService clientSessionCtxService;
 
+    // all tests of this class share the same broker, so every client created by a test is tracked here and
+    // released in the @After block. Cleaning up in the test body instead would leak clients (and their
+    // subscriptions) into the next test as soon as an assertion fails before the disconnect is reached.
+    private final List<MqttClient> clients = new ArrayList<>();
+
     private MqttClient shareSubClient1;
     private MqttClient shareSubClient2;
 
     @After
     public void clear() throws Exception {
-        MqttClientConfig config = new MqttClientConfig();
-        config.setCleanSession(true);
-        config.setProtocolVersion(MqttVersion.MQTT_3_1_1);
-        disconnectWithCleanSession(shareSubClient1, config);
-        disconnectWithCleanSession(shareSubClient2, config);
+        try {
+            for (MqttClient client : clients) {
+                releaseClient(client);
+            }
+        } finally {
+            clients.clear();
+            shareSubClient1 = null;
+            shareSubClient2 = null;
+        }
     }
 
-    private void disconnectWithCleanSession(MqttClient client, MqttClientConfig config) throws Exception {
-        if (client != null) {
-            if (client.isConnected()) {
-                client.disconnect();
-                Thread.sleep(50);
-            }
-            client = MqttClient.create(config, null, externalExecutorService);
-            client.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+    private void releaseClient(MqttClient client) throws Exception {
+        if (client.isConnected()) {
             client.disconnect();
         }
+        if (client.getClientConfig().isCleanSession()) {
+            return;
+        }
+        // a persistent session outlives DISCONNECT, so reconnect with the SAME client id and cleanSession=true
+        // to drop the session together with its subscriptions
+        MqttClientConfig config = newMqttClientConfig();
+        config.setClientId(client.getClientConfig().getClientId());
+        config.setCleanSession(true);
+        config.setProtocolVersion(MqttVersion.MQTT_3_1_1);
+        MqttClient cleanSessionClient = MqttClient.create(config, null, externalExecutorService);
+        cleanSessionClient.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        cleanSessionClient.disconnect();
     }
 
     @Test
@@ -167,11 +184,8 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         shareSubClient1.disconnect();
         shareSubClient2.disconnect();
 
-        Awaitility.await().atMost(5, TimeUnit.SECONDS).until(() -> {
-            ClientSessionInfo clientSessionInfo1 = clientSessionService.getClientSessionInfo(shareSubClient1.getClientConfig().getClientId());
-            ClientSessionInfo clientSessionInfo2 = clientSessionService.getClientSessionInfo(shareSubClient2.getClientConfig().getClientId());
-            return !clientSessionInfo1.isConnected() && !clientSessionInfo2.isConnected();
-        });
+        Awaitility.await().atMost(5, TimeUnit.SECONDS)
+                .until(() -> isSessionDisconnected(shareSubClient1) && isSessionDisconnected(shareSubClient2));
 
         //pub
         MqttClient pubClient = getMqttPubClient();
@@ -180,7 +194,7 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
             Thread.sleep(50);
         }
 
-        shareSubClient1.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        shareSubClient1 = reconnect(shareSubClient1, handler1);
 
         boolean await = receivedResponses.await(2, TimeUnit.SECONDS);
         log.debug("The result of awaiting should be [false], actual is: [{}]", await);
@@ -215,11 +229,8 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         shareSubClient1.disconnect();
         shareSubClient2.disconnect();
 
-        Awaitility.await().atMost(5, TimeUnit.SECONDS).until(() -> {
-            ClientSessionInfo clientSessionInfo1 = clientSessionService.getClientSessionInfo(shareSubClient1.getClientConfig().getClientId());
-            ClientSessionInfo clientSessionInfo2 = clientSessionService.getClientSessionInfo(shareSubClient2.getClientConfig().getClientId());
-            return !clientSessionInfo1.isConnected() && !clientSessionInfo2.isConnected();
-        });
+        Awaitility.await().atMost(5, TimeUnit.SECONDS)
+                .until(() -> isSessionDisconnected(shareSubClient1) && isSessionDisconnected(shareSubClient2));
 
         //pub
         MqttClient pubClient = getMqttPubClient();
@@ -228,7 +239,7 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
             Thread.sleep(50);
         }
 
-        shareSubClient1.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        shareSubClient1 = reconnect(shareSubClient1, handler1);
 
         boolean await = receivedResponses.await(2, TimeUnit.SECONDS);
         log.debug("The result of awaiting should be [false], actual is: [{}]", await);
@@ -236,7 +247,7 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         //asserts
         assertEquals(0, shareSubClient1ReceivedMessages.get() + shareSubClient2ReceivedMessages.get());
 
-        shareSubClient2.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        shareSubClient2 = reconnect(shareSubClient2, handler2);
         shareSubClient2.on("$share/g1/test/+/d", getHandler(receivedResponses, shareSubClient1ReceivedMessages), MqttQoS.AT_LEAST_ONCE).get(30, TimeUnit.SECONDS);
 
         Awaitility.await().atMost(10, TimeUnit.SECONDS)
@@ -288,17 +299,23 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
 
     @Test
     public void givenSharedSubsGroupWith2ClientsAnd1NonSharedSubClientFromSameGroup_whenPubMsgToTopic_thenReceiveCorrectNumberOfMessages() throws Throwable {
-        CountDownLatch receivedResponses = new CountDownLatch(TOTAL_MSG_COUNT + TOTAL_MSG_COUNT / 2);
+        // the shared subscription is served in turn, while the second client gets every message once more
+        // via its non-shared subscription
+        int expectedSubClient1Messages = TOTAL_MSG_COUNT / 2;
+        int expectedSubClient2Messages = TOTAL_MSG_COUNT + TOTAL_MSG_COUNT / 2;
+        // both clients count down the same latch: awaiting only the messages of one of them leaves the
+        // messages of the other one in flight when the assertions are executed
+        CountDownLatch receivedResponses = new CountDownLatch(expectedSubClient1Messages + expectedSubClient2Messages);
 
         AtomicInteger shareSubClient1ReceivedMessages = new AtomicInteger();
         AtomicInteger shareSubClient2ReceivedMessages = new AtomicInteger();
 
         //sub
-        MqttClient shareSubClient1 = getMqttSubClient(getHandler(shareSubClient1ReceivedMessages), "$share/g1/test/+/b");
+        MqttClient subClient1 = getMqttSubClient(getHandler(receivedResponses, shareSubClient1ReceivedMessages), "$share/g1/test/+/b");
 
         MqttHandler handler = getHandler(receivedResponses, shareSubClient2ReceivedMessages);
-        MqttClient shareSubClient2 = getMqttSubClient(handler, "$share/g1/test/+/b");
-        shareSubClient2.on("+/topic/b", handler, MqttQoS.AT_LEAST_ONCE).get(30, TimeUnit.SECONDS);
+        MqttClient subClient2 = getMqttSubClient(handler, "$share/g1/test/+/b");
+        subClient2.on("+/topic/b", handler, MqttQoS.AT_LEAST_ONCE).get(30, TimeUnit.SECONDS);
 
         //pub
         MqttClient pubClient = getMqttPubClient();
@@ -312,14 +329,14 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         assertTrue(await);
 
         //asserts
-        assertEquals(TOTAL_MSG_COUNT / 2, shareSubClient1ReceivedMessages.get());
-        assertEquals(TOTAL_MSG_COUNT + TOTAL_MSG_COUNT / 2, shareSubClient2ReceivedMessages.get());
+        assertEquals(expectedSubClient1Messages, shareSubClient1ReceivedMessages.get());
+        assertEquals(expectedSubClient2Messages, shareSubClient2ReceivedMessages.get());
 
         //disconnect clients
         disconnectClient(pubClient);
 
-        disconnectClient(shareSubClient1);
-        disconnectClient(shareSubClient2);
+        disconnectClient(subClient1);
+        disconnectClient(subClient2);
     }
 
 
@@ -349,20 +366,18 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         shareSubClient1.on("$share/g1/my/test/data", handler1, MqttQoS.AT_LEAST_ONCE).get(30, TimeUnit.SECONDS);
         shareSubClient2.on("$share/g1/my/test/data", handler2, MqttQoS.AT_LEAST_ONCE).get(30, TimeUnit.SECONDS);
 
+        // the subscription count of this broker is shared by all tests, so check these two clients only
         Awaitility
                 .await()
                 .atMost(5, TimeUnit.SECONDS)
-                .until(() -> clientSubscriptionService.getClientSubscriptionsCount() == 2);
+                .until(() -> hasSingleSubscription(shareSubClient1) && hasSingleSubscription(shareSubClient2));
 
         //disconnect
         shareSubClient1.disconnect();
         shareSubClient2.disconnect();
 
-        Awaitility.await().atMost(5, TimeUnit.SECONDS).until(() -> {
-            ClientSessionInfo clientSessionInfo1 = clientSessionService.getClientSessionInfo(shareSubClient1.getClientConfig().getClientId());
-            ClientSessionInfo clientSessionInfo2 = clientSessionService.getClientSessionInfo(shareSubClient2.getClientConfig().getClientId());
-            return !clientSessionInfo1.isConnected() && !clientSessionInfo2.isConnected();
-        });
+        Awaitility.await().atMost(5, TimeUnit.SECONDS)
+                .until(() -> isSessionDisconnected(shareSubClient1) && isSessionDisconnected(shareSubClient2));
 
         //pub
         MqttClient pubClient = getMqttPubClient();
@@ -371,14 +386,14 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         }
         Thread.sleep(50);
 
-        shareSubClient1.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        shareSubClient1 = reconnect(shareSubClient1, handler1);
 
         Awaitility.await().atMost(5, TimeUnit.SECONDS).until(() -> {
             ClientSessionCtx clientCtx = clientSessionCtxService.getClientSessionCtx(shareSubClient1.getClientConfig().getClientId());
             return clientCtx != null;
         });
 
-        shareSubClient2.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        shareSubClient2 = reconnect(shareSubClient2, handler2);
 
         boolean await = receivedResponses.await(10, TimeUnit.SECONDS);
         log.debug("The result of awaiting is: [{}]", await);
@@ -457,26 +472,59 @@ public class SharedSubscriptionsIntegrationTestCase extends AbstractPubSubIntegr
         return getClient(handler, true);
     }
 
+    /**
+     * Reconnects a persistent client with a <b>fresh</b> {@link MqttClient} under the same client id, the same
+     * cleanSession and the same default handler.
+     * <p>
+     * Never call {@code connect()} on an instance that has been {@code disconnect()}ed. netty-mqtt writes
+     * {@code MqttClientImpl#disconnected} only in the constructor and in {@code disconnect()} and never resets it,
+     * so such an instance reports {@code isConnected() == false} for ever and {@code scheduleConnectIfRequired}
+     * refuses to reconnect it. On 4.3.1 that is worse than cosmetic in two ways this class was hitting:
+     * {@code disconnect()} now early-returns when the flag is already set, so the {@code disconnectClient(...)}
+     * calls at the end of these tests were silent no-ops leaking a connected session into {@code @After}; and
+     * {@code disconnect()} arms a one-second fallback that closes whatever {@code MqttClientImpl#channel} points at
+     * when it fires, which can tear down a channel opened by a reconnect inside that second.
+     * <p>
+     * Semantics are unchanged: the broker keeps the persistent session under the same client id, and these tests
+     * deliver through the handler that {@link #getClient} installs as netty-mqtt's <em>default</em> handler.
+     */
+    private MqttClient reconnect(MqttClient disconnected, MqttHandler handler) throws Exception {
+        MqttClientConfig config = newMqttClientConfig();
+        config.setClientId(disconnected.getClientConfig().getClientId());
+        config.setCleanSession(disconnected.getClientConfig().isCleanSession());
+        config.setProtocolVersion(MqttVersion.MQTT_3_1_1);
+        MqttClient client = MqttClient.create(config, handler, externalExecutorService);
+        // the instance being replaced is already disconnected, and the replacement carries its client id, so
+        // releasing both would only make the @After cleanup take the same session over twice
+        clients.remove(disconnected);
+        clients.add(client);
+        client.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
+        return client;
+    }
+
     private MqttClient getClient(MqttHandler handler, boolean cleanSession) throws Exception {
-        MqttClientConfig config = new MqttClientConfig();
+        MqttClientConfig config = newMqttClientConfig();
         config.setCleanSession(cleanSession);
         config.setProtocolVersion(MqttVersion.MQTT_3_1_1);
         MqttClient client = MqttClient.create(config, handler, externalExecutorService);
+        clients.add(client);
         client.connect("localhost", mqttPort).get(30, TimeUnit.SECONDS);
         return client;
+    }
+
+    private boolean isSessionDisconnected(MqttClient client) {
+        ClientSessionInfo clientSessionInfo = clientSessionService.getClientSessionInfo(client.getClientConfig().getClientId());
+        return clientSessionInfo == null || !clientSessionInfo.isConnected();
+    }
+
+    private boolean hasSingleSubscription(MqttClient client) {
+        return clientSubscriptionService.getClientSubscriptions(client.getClientConfig().getClientId()).size() == 1;
     }
 
     private MqttHandler getHandler(CountDownLatch latch, AtomicInteger integer) {
         return (s, byteBuf) -> {
             integer.incrementAndGet();
             latch.countDown();
-            return Futures.immediateVoidFuture();
-        };
-    }
-
-    private MqttHandler getHandler(AtomicInteger integer) {
-        return (s, byteBuf) -> {
-            integer.incrementAndGet();
             return Futures.immediateVoidFuture();
         };
     }
