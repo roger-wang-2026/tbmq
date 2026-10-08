@@ -16,14 +16,19 @@
 package org.thingsboard.mqtt.broker.service.testing.integration.executor;
 
 import org.springframework.stereotype.Component;
-import org.thingsboard.common.util.AbstractListeningExecutor;
+import org.thingsboard.mqtt.broker.common.util.AbstractListeningExecutor;
 
 @Component
 public class ExternalExecutorService extends AbstractListeningExecutor {
 
     @Override
-    protected int getThreadPollSize() {
+    protected int getThreadPoolSize() {
         return 10;
+    }
+
+    @Override
+    protected String getExecutorName() {
+        return "External";
     }
 
 }

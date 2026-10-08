@@ -1,0 +1,203 @@
+/**
+ * Copyright © 2016-2026 The Thingsboard Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.thingsboard.mqtt;
+
+import io.netty.channel.EventLoop;
+import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
+import io.netty.util.concurrent.Promise;
+import lombok.AccessLevel;
+import lombok.Getter;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+@Getter(AccessLevel.PACKAGE)
+final class MqttPendingSubscription {
+
+    private final Promise<MqttQoS> future;
+    private final String topic;
+    /** The handler this SUBSCRIBE's on() registered, or the one a later on() for the filter replaced it with; a failure unregisters it. */
+    private volatile MqttHandler handler;
+    private final MqttSubscribeMessage subscribeMessage;
+    /**
+     * The client's latest connect attempt when this was made, 0 before the first: giving up on that attempt or a later
+     * one fails this while it still waits for a connection, whereas giving up on an earlier one spares it.
+     */
+    private final int connectAttempt;
+    /**
+     * Whether the library made this SUBSCRIBE itself, to restore a registered filter the server may not hold after a
+     * reconnect. Its failure keeps the filter registered and is reported to
+     * {@link MqttClientCallback#onResubscribeFailed}; a caller's on() that joins it takes it over.
+     */
+    private volatile boolean resubscribe;
+
+    @Getter(AccessLevel.NONE)
+    private final RetransmissionHandler<MqttSubscribeMessage> retransmissionHandler;
+
+    @Getter(AccessLevel.NONE)
+    private final AtomicBoolean sent = new AtomicBoolean();
+
+    /**
+     * Set by {@link MqttClientImpl#failSubscription}; read and written only under the client's registry lock, which
+     * orders it against the handler replacement of an on() for the filter in flight.
+     */
+    @Getter(AccessLevel.NONE)
+    private boolean failed;
+
+    private MqttPendingSubscription(
+            Promise<MqttQoS> future,
+            String topic,
+            MqttHandler handler,
+            MqttSubscribeMessage subscribeMessage,
+            int connectAttempt,
+            String ownerId,
+            MqttClientConfig.RetransmissionConfig retransmissionConfig,
+            PendingOperation operation,
+            boolean resubscribe
+    ) {
+        this.future = future;
+        this.topic = topic;
+        this.handler = handler;
+        this.subscribeMessage = subscribeMessage;
+        this.connectAttempt = connectAttempt;
+        this.resubscribe = resubscribe;
+
+        retransmissionHandler = new RetransmissionHandler<>(retransmissionConfig, operation, ownerId);
+        retransmissionHandler.setOriginalMessage(subscribeMessage);
+    }
+
+    /**
+     * Replaces the handler, for an on() made while this SUBSCRIBE is in flight: the last one wins, and a resubscribe
+     * becomes that on()'s own. Called under the client's registry lock, and only while {@link #isFailed()} is false.
+     */
+    void setHandler(MqttHandler handler) {
+        this.handler = handler;
+        this.resubscribe = false;
+    }
+
+    /**
+     * Claims the write of {@link #getSubscribeMessage()}: only the caller that gets {@code true} may write it, and must
+     * write it to an active channel - {@code on()} when the client's channel is active, else the CONNACK resend of the
+     * next connection. A claim counts the SUBSCRIBE as sent, so the CONNACK resend skips it from then on.
+     */
+    boolean markSent() {
+        return sent.compareAndSet(false, true);
+    }
+
+    /** Only the caller that won {@link #markSent()} starts the timer, so it starts at most once. */
+    void startRetransmitTimer(EventLoop eventLoop, Consumer<Object> sendPacket) {
+        retransmissionHandler.setHandler((fixedHeader, originalMessage) ->
+                sendPacket.accept(new MqttSubscribeMessage(fixedHeader, originalMessage.variableHeader(), originalMessage.payload())));
+        retransmissionHandler.start(eventLoop);
+    }
+
+    /** Whether this SUBSCRIBE failed: an on() that joins it then registers nothing. Under the client's registry lock only. */
+    boolean isFailed() {
+        return failed;
+    }
+
+    /** Under the client's registry lock only, together with unregistering a caller's handler. */
+    void markFailed() {
+        failed = true;
+    }
+
+    /** The QoS this SUBSCRIBE asks for. */
+    MqttQoS getRequestedQos() {
+        return subscribeMessage.payload().topicSubscriptions().get(0).qualityOfService();
+    }
+
+    void onSubackReceived() {
+        retransmissionHandler.stop();
+    }
+
+    /**
+     * Fails the future with {@code cause} and stops retransmitting. Must only be called by the path that removed this
+     * entry from the pending subscriptions.
+     */
+    void fail(Throwable cause) {
+        retransmissionHandler.stop();
+        future.tryFailure(cause);
+    }
+
+    static Builder builder() {
+        return new Builder();
+    }
+
+    static class Builder {
+
+        private Promise<MqttQoS> future;
+        private String topic;
+        private MqttHandler handler;
+        private MqttSubscribeMessage subscribeMessage;
+        private int connectAttempt;
+        private String ownerId;
+        private PendingOperation pendingOperation;
+        private MqttClientConfig.RetransmissionConfig retransmissionConfig;
+        private boolean resubscribe;
+
+        Builder future(Promise<MqttQoS> future) {
+            this.future = future;
+            return this;
+        }
+
+        Builder topic(String topic) {
+            this.topic = topic;
+            return this;
+        }
+
+        Builder handler(MqttHandler handler) {
+            this.handler = handler;
+            return this;
+        }
+
+        Builder subscribeMessage(MqttSubscribeMessage subscribeMessage) {
+            this.subscribeMessage = subscribeMessage;
+            return this;
+        }
+
+        Builder connectAttempt(int connectAttempt) {
+            this.connectAttempt = connectAttempt;
+            return this;
+        }
+
+        Builder ownerId(String ownerId) {
+            this.ownerId = ownerId;
+            return this;
+        }
+
+        Builder retransmissionConfig(MqttClientConfig.RetransmissionConfig retransmissionConfig) {
+            this.retransmissionConfig = retransmissionConfig;
+            return this;
+        }
+
+        Builder pendingOperation(PendingOperation pendingOperation) {
+            this.pendingOperation = pendingOperation;
+            return this;
+        }
+
+        Builder resubscribe(boolean resubscribe) {
+            this.resubscribe = resubscribe;
+            return this;
+        }
+
+        MqttPendingSubscription build() {
+            return new MqttPendingSubscription(future, topic, handler, subscribeMessage, connectAttempt, ownerId, retransmissionConfig, pendingOperation, resubscribe);
+        }
+
+    }
+
+}
